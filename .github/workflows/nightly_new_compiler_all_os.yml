@@ -1,30 +1,31 @@
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
-      force:
-        description: "Publish even if a nightly was already released today (or this commit was already released). The tag still has to be free: re-releasing the same commit on the same day collides with the existing tag and fails."
-        type: boolean
-        default: false
-  schedule:
-    - cron: "0 9 * * *"
+      ref:
+        description: "Branch, tag or commit of Karakatiza666/roc to build."
+        type: string
+        default: reify
+      base_nightly:
+        description: "The roc-lang/nightlies tag that the ref is rebased on, for example nightly-2026-11-03-34bd006. Its date becomes the date of the release tag."
+        type: string
+        required: true
 
-name: Nightly release for new compiler
+name: Nightly release for new compiler (reify)
 
 # Do not add permissions here! Configure them at the job level!
 permissions: {}
 
-# A manual run and the 9:00 UTC cron can otherwise overlap: the release guard
-# in resolve-roc-ref reads published releases, so a run that starts while
-# another is still building sees no release yet and happily builds a second
-# one. Queueing the newcomer means it resolves after the first has published,
-# and the guard then skips it. PRs get their own group so they stay parallel.
+# Two manual runs can otherwise overlap: the tag guard in resolve-roc-ref
+# reads existing tags, so a run that starts while another is still building
+# sees no tag yet. Queueing the newcomer means it resolves after the first has
+# published, and the guard then fails it.
 concurrency:
-  group: nightly-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  group: nightly-reify
   cancel-in-progress: false
 
 env:
   ZIG_VERSION: 0.17.0
+  ROC_REPO: Karakatiza666/roc
 jobs:
   resolve-roc-ref:
     name: Resolve roc commit and date
@@ -32,168 +33,83 @@ jobs:
     permissions:
       contents: read
     outputs:
-      sha: ${{ steps.green.outputs.sha }}
-      sha_full: ${{ steps.green.outputs.sha_full }}
-      already_released: ${{ steps.green.outputs.already_released }}
-      date: ${{ steps.green.outputs.date }}
-      tag: ${{ steps.ref.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      sha_full: ${{ steps.resolve.outputs.sha_full }}
+      date: ${{ steps.resolve.outputs.date }}
+      base_nightly: ${{ steps.resolve.outputs.base_nightly }}
+      tag: ${{ steps.resolve.outputs.tag }}
 
     steps:
-      # Don't build from main's tip: a bypass merge can land a PR whose CI was
-      # red, and main is then broken until someone notices. roc's main ruleset
-      # requires exactly one status check, `finish` (the aggregate job of roc's
-      # ci_manager.yml), so "CI passed" for a commit means `finish` was green on
-      # the head of the PR that produced it. Walk main backwards and take the
-      # newest merge commit that landed that way.
-      #
-      # This does not catch every broken main: roc's ruleset sets
-      # strict_required_status_checks_policy=false, so a PR can be green against
-      # a stale base and still break main once merged. Catching that needs
-      # roc's own Nightly Gate (nightly_gate.yml), which runs the full suite on
-      # main and fast-forwards refs/heads/nightly on success. Switch the
-      # resolution below to that branch once it starts passing.
-      - name: Resolve newest green roc-lang/roc commit
-        id: green
+      # There is no CI-green check for the fork. The caller names the commit
+      # and the upstream nightly it is rebased on. This step checks that both
+      # exist and that the base commit is an ancestor of the commit to build.
+      - name: Resolve ref, base nightly and tag
+        id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ROC_REPO: roc-lang/roc
-          # Two API calls per candidate; the walk is normally 1-3 candidates.
-          MAX_COMMITS: 50
-          FORCE: ${{ inputs.force }}
+          REF: ${{ inputs.ref }}
+          BASE_NIGHTLY: ${{ inputs.base_nightly }}
         run: |
           set -euo pipefail
 
-          # GitHub Actions' app id, matching the integration_id that roc's
-          # ruleset pins `finish` to, so an unrelated check of the same name
-          # from another app cannot stand in for it.
-          ACTIONS_APP_ID=15368
+          if ! [[ "$BASE_NIGHTLY" =~ ^nightly-([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9a-f]{7,40})$ ]]; then
+            echo "::error::base_nightly '$BASE_NIGHTLY' does not match nightly-YYYY-MM-DD-<sha>, for example nightly-2026-11-03-34bd006."
+            exit 1
+          fi
+          DATE="${BASH_REMATCH[1]}"
+          BASE_SHA="${BASH_REMATCH[2]}"
 
-          picked=""
-          skipped=0
-          checked=0
-          page=1
-          while [ -z "$picked" ] && [ "$checked" -lt "$MAX_COMMITS" ]; do
-            commits=$(gh api "repos/$ROC_REPO/commits?sha=main&per_page=50&page=$page" --jq '.[].sha')
-            [ -n "$commits" ] || break
-
-            # Unquoted on purpose: shas are hex, so word splitting is the split.
-            for sha in $commits; do
-              checked=$((checked + 1))
-              [ "$checked" -le "$MAX_COMMITS" ] || break
-
-              # Commits that reached main inside a merge were never main's tip
-              # on their own, so only merge commits are release candidates.
-              head_sha=$(gh api "repos/$ROC_REPO/commits/$sha/pulls" \
-                --jq "[.[] | select(.merged_at != null and .merge_commit_sha == \"$sha\")][0].head.sha // empty")
-              if [ -z "$head_sha" ]; then
-                echo "skip ${sha:0:7}: not the merge commit of a merged PR"
-                continue
-              fi
-
-              verdict=$(gh api "repos/$ROC_REPO/commits/$head_sha/check-runs?check_name=finish&per_page=100" \
-                --jq "[.check_runs[] | select(.status == \"completed\" and .app.id == $ACTIONS_APP_ID)][0].conclusion // \"missing\"")
-              if [ "$verdict" = "success" ]; then
-                echo "pick ${sha:0:7}: finish=success on PR head ${head_sha:0:7}"
-                picked="$sha"
-                break
-              fi
-
-              skipped=$((skipped + 1))
-              echo "skip ${sha:0:7}: finish=$verdict on PR head ${head_sha:0:7}"
-            done
-
-            page=$((page + 1))
-          done
-
-          if [ -z "$picked" ]; then
-            echo "::error::No roc-lang/roc main commit in the last $MAX_COMMITS commits landed with a green 'finish' check. Refusing to publish a nightly from a main that has no known-good commit."
+          # The base nightly has to be a real upstream release.
+          if ! gh api "repos/roc-lang/nightlies/releases/tags/$BASE_NIGHTLY" --silent; then
+            echo "::error::No release $BASE_NIGHTLY exists in roc-lang/nightlies."
             exit 1
           fi
 
-          if [ "$skipped" -gt 0 ]; then
-            echo "::warning::Skipped $skipped roc-lang/roc main commit(s) that landed with a red or missing 'finish' check. Building ${picked:0:7} instead of main's tip."
+          if ! picked=$(gh api "repos/$ROC_REPO/commits/$REF" --jq .sha); then
+            echo "::error::Could not resolve ref '$REF' in $ROC_REPO."
+            exit 1
           fi
-
           short="${picked:0:7}"
 
-          # Resolved here rather than in a later step so both halves of the
-          # guard below and the tag itself agree on one date, even across a
-          # midnight boundary. The runner clock is UTC, which is also what the
-          # cron schedule above is in.
-          DATE=$(date -u "+%Y-%m-%d")
-
-          # Two ways an already-published nightly can come round again, both
-          # checked against the existing release tags
-          # (`nightly-YYYY-MM-DD-<short sha>`):
-          #
-          # 1. Same commit, any day. The tag carries the date, so a repeat of
-          #    the same commit collides with nothing and would publish
-          #    silently. That is the common case rather than the rare one:
-          #    while main sits red the walk above keeps returning the same
-          #    green commit every day, and the cost is a full 5-OS build plus a
-          #    9-OS test matrix for bits we already shipped.
-          #
-          # 2. Same day, any commit. A manual workflow_dispatch releases, then
-          #    the cron fires later the same day; if anything green landed in
-          #    between, the sha differs and check 1 lets it through. That is
-          #    two nightlies for one date, which is exactly what "nightly"
-          #    promises not to be.
-          # Fetched into a variable rather than inlined into the `for` below:
-          # a command substitution that fails there is not caught by `set -e`,
-          # so a hiccup listing releases would silently mean zero iterations,
-          # no match, and the duplicate release this guard exists to stop.
-          # As an assignment, a failure aborts the step instead.
-          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
-
-          same_sha=""
-          same_day=""
-          for tag in $tags; do
-            case "$tag" in
-              *-"$short") [ -n "$same_sha" ] || same_sha="$tag" ;;
-            esac
-            case "$tag" in
-              nightly-"$DATE"-*) [ -n "$same_day" ] || same_day="$tag" ;;
-            esac
-            [ -n "$same_sha" ] && [ -n "$same_day" ] && break
-          done
-
-          already_released=false
-          if [ -n "$same_day" ]; then
-            echo "::notice::$same_day was already released today ($DATE). Skipping this nightly; re-run with the 'force' input if a second release today is really wanted."
-            already_released=true
-          elif [ -n "$same_sha" ]; then
-            echo "::notice::roc-lang/roc $short was already published as $same_sha, and nothing newer has landed green on main. Skipping this nightly."
-            already_released=true
+          if ! base_full=$(gh api "repos/roc-lang/roc/commits/$BASE_SHA" --jq .sha); then
+            echo "::error::Could not resolve base commit $BASE_SHA in roc-lang/roc."
+            exit 1
           fi
 
-          if [ "$already_released" = "true" ] && [ "$FORCE" = "true" ]; then
-            echo "::warning::Publishing anyway because the 'force' input was set."
-            already_released=false
+          # "identical" and "ahead" mean the base is the commit itself or one
+          # of its ancestors. "behind" and "diverged" mean it is not.
+          status=$(gh api "repos/$ROC_REPO/compare/$base_full...$picked" --jq .status)
+          case "$status" in
+            identical|ahead) echo "$ROC_REPO $short is $status of the base $BASE_NIGHTLY ($base_full)." ;;
+            *)
+              echo "::error::The base commit ${base_full:0:7} of $BASE_NIGHTLY is not an ancestor of $ROC_REPO $short (compare status: $status). Rebase the ref on that nightly, or pass the matching base_nightly."
+              exit 1
+              ;;
+          esac
+
+          # The date comes from the base nightly, so the tag lines up with the
+          # upstream nightly the fork is rebased on.
+          TAG="nightly-reify-$DATE-$short"
+
+          # The tag is the single source of truth for this release's identity:
+          # it names the release, and is baked into the binary via roc's
+          # -Dcompiler-version so `roc version` reports the release the user
+          # actually downloaded. It must be free.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent 2>/dev/null \
+            || gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::The tag or release $TAG already exists in $GITHUB_REPOSITORY. Delete it first if a rebuild is really wanted."
+            exit 1
           fi
 
-          echo "already_released=$already_released" >> $GITHUB_OUTPUT
           echo "date=$DATE" >> $GITHUB_OUTPUT
           echo "sha=$short" >> $GITHUB_OUTPUT
           echo "sha_full=$picked" >> $GITHUB_OUTPUT
-
-      - name: Resolve tag
-        id: ref
-        env:
-          SHA: ${{ steps.green.outputs.sha }}
-          DATE: ${{ steps.green.outputs.date }}
-        run: |
-          # The single source of truth for this nightly's identity: it names the
-          # release, and is baked into the binary via roc's -Dcompiler-version so
-          # `roc version` reports the release the user actually downloaded.
-          echo "tag=nightly-$DATE-$SHA" >> $GITHUB_OUTPUT
+          echo "base_nightly=$BASE_NIGHTLY" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
   build-and-package:
     name: build and package nightly release
     needs: resolve-roc-ref
-    # PR runs exist to exercise the build, so they build regardless; only the
-    # publishing paths skip. publish-release repeats this same guard, because
-    # it no longer takes a skipped or failed build here as a reason to skip.
-    if: github.event_name == 'pull_request' || needs.resolve-roc-ref.outputs.already_released != 'true'
     runs-on: ${{ matrix.os }}
     env:
       SHA: ${{ needs.resolve-roc-ref.outputs.sha }}
@@ -220,10 +136,10 @@ jobs:
         shell: bash
 
     steps:
-      - name: Checkout roc-lang/roc
+      - name: Checkout Karakatiza666/roc
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
         with:
-          repository: roc-lang/roc
+          repository: ${{ env.ROC_REPO }}
           ref: ${{ needs.resolve-roc-ref.outputs.sha_full }}
           path: roc-src
 
@@ -342,21 +258,9 @@ jobs:
           }
 
       # Fail fast on a compiler that can't actually run a Roc program, before
-      # spending time packaging and publishing it. Pins hello_world_test.roc's
-      # roc: field to this nightly's tag so the smoke test exercises the exact
-      # version string that will ship, and every matrix leg's binary has to
-      # pass this before publish-release (which needs this job) can run.
-      - name: Pin hello_world_test.roc to this nightly
-        # TEMP disabled: hello_world_test.roc is headerless for now.
-        if: false
-        env:
-          TAG: ${{ needs.resolve-roc-ref.outputs.tag }}
-        run: |
-          FILE=nightlies-repo/hello_world_test.roc
-          PLATFORM_URL=$(grep -oE 'pf:[[:space:]]*platform[[:space:]]*"[^"]*"' "$FILE" | grep -oE '"[^"]*"' | tr -d '"')
-          perl -0777 -pi -e "s|app \[main!\] \{.*?\}|app [main!] {\n\tpf: platform \"$PLATFORM_URL\",\n\troc: \"$TAG\",\n}|s" "$FILE"
-          cat "$FILE"
-
+      # spending time packaging and publishing it. Every matrix leg's binary
+      # has to pass this before publish-release (which needs this job) can run.
+      #
       # Running the test program downloads the platform tarball from GitHub
       # releases, and that download flakes: 2026-09-15's macos_x86_64 leg died
       # on "── ✗ download failed ── ... Error: HttpError" and took the whole
@@ -386,7 +290,7 @@ jobs:
           retry_count: 3
 
       - name: build file name
-        run: echo "RELEASE_FOLDER_NAME=roc_nightly-${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
+        run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
 
       - name: Package release
         run: |
@@ -434,14 +338,13 @@ jobs:
   build-wasm-artifacts:
     name: build compressed web wasm artifacts
     needs: resolve-roc-ref
-    if: github.event_name == 'pull_request' || needs.resolve-roc-ref.outputs.already_released != 'true'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout roc-lang/roc
+      - name: Checkout Karakatiza666/roc
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
         with:
-          repository: roc-lang/roc
+          repository: ${{ env.ROC_REPO }}
           ref: ${{ needs.resolve-roc-ref.outputs.sha_full }}
           path: roc-src
 
@@ -498,7 +401,6 @@ jobs:
   package-source:
     name: Package roc source code
     needs: resolve-roc-ref
-    if: github.event_name == 'pull_request' || needs.resolve-roc-ref.outputs.already_released != 'true'
     runs-on: ubuntu-latest
     env:
       SHA: ${{ needs.resolve-roc-ref.outputs.sha }}
@@ -507,18 +409,18 @@ jobs:
     steps:
       # GitHub's own "Source code" assets on a release are the source of *this*
       # repo at the tag, which is just the workflow, not the compiler that was
-      # built. Ship the roc-lang/roc tree at the exact commit these binaries
+      # built. Ship the Karakatiza666/roc tree at the exact commit these binaries
       # came from, so a release stays buildable even if that commit later
-      # disappears from roc-lang/roc (force-push, rewritten history, deleted repo).
-      - name: Checkout roc-lang/roc
+      # disappears from Karakatiza666/roc (force-push, rewritten history, deleted repo).
+      - name: Checkout Karakatiza666/roc
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
         with:
-          repository: roc-lang/roc
+          repository: ${{ env.ROC_REPO }}
           ref: ${{ needs.resolve-roc-ref.outputs.sha_full }}
           path: roc-src
 
       - name: build file name
-        run: echo "SOURCE_FOLDER_NAME=roc_nightly-source-$DATE-$SHA" >> $GITHUB_ENV
+        run: echo "SOURCE_FOLDER_NAME=roc_nightly-reify-source-$DATE-$SHA" >> $GITHUB_ENV
 
       - name: Prepare source folder
         run: |
@@ -561,16 +463,12 @@ jobs:
     # archives that did build are still worth shipping, and a missing one is
     # better than nothing at all for that day. So instead of inheriting the
     # default "skip if any dependency failed", this job runs as long as the
-    # run was not cancelled and resolve-roc-ref itself produced a tag; the
-    # already_released guard the build jobs use has to be repeated here for
-    # the same reason. Which archives actually exist is decided below, from
-    # what was uploaded. The failed build leg still shows up red, so the run
+    # run was not cancelled and resolve-roc-ref itself produced a tag. Which archives
+    # actually exist is decided below, from what was uploaded. The failed build leg still shows up red, so the run
     # as a whole is still reported as failed.
     if: >-
       ${{ !cancelled()
-        && github.event_name != 'pull_request'
-        && needs.resolve-roc-ref.result == 'success'
-        && needs.resolve-roc-ref.outputs.already_released != 'true' }}
+        && needs.resolve-roc-ref.result == 'success' }}
     needs: [resolve-roc-ref, build-and-package, build-wasm-artifacts, package-source]
     runs-on: ubuntu-latest
     outputs:
@@ -579,6 +477,8 @@ jobs:
       contents: write
     env:
       SHA: ${{ needs.resolve-roc-ref.outputs.sha }}
+      SHA_FULL: ${{ needs.resolve-roc-ref.outputs.sha_full }}
+      BASE_NIGHTLY: ${{ needs.resolve-roc-ref.outputs.base_nightly }}
       TAG: ${{ needs.resolve-roc-ref.outputs.tag }}
 
     steps:
@@ -602,7 +502,7 @@ jobs:
 
           built=()
           for platform in macos_x86_64 macos_apple_silicon linux_x86_64 linux_arm64 windows_x86_64; do
-            if compgen -G "artifacts/roc_nightly-$platform-*/*" > /dev/null; then
+            if compgen -G "artifacts/roc_nightly-reify-$platform-*/*" > /dev/null; then
               built+=("$platform")
             else
               echo "::warning::No archive was built for $platform; it will be missing from $TAG."
@@ -615,7 +515,7 @@ jobs:
           fi
           echo "Publishing archives for: ${built[*]}"
 
-          for extra in playground.wasm.zst repl.wasm.zst echo.wasm.zst "roc_nightly-source-*"; do
+          for extra in playground.wasm.zst repl.wasm.zst echo.wasm.zst "roc_nightly-reify-source-*"; do
             compgen -G "artifacts/$extra/*" > /dev/null \
               || echo "::warning::$extra is missing from $TAG."
           done
@@ -644,9 +544,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BODY="Nightly build of new Roc compiler from roc-lang/roc commit [${{ env.SHA }}](https://github.com/roc-lang/roc/commit/${{ env.SHA }}), the most recent commit on main that landed with a passing CI run.
+          BODY="Nightly build of the new Roc compiler from the reify branch of [Karakatiza666/roc](https://github.com/Karakatiza666/roc), commit [${{ env.SHA }}](https://github.com/Karakatiza666/roc/commit/${{ env.SHA_FULL }}), rebased on upstream nightly [${{ env.BASE_NIGHTLY }}](https://github.com/roc-lang/nightlies/releases/tag/${{ env.BASE_NIGHTLY }}).
 
-          The \`roc_nightly-source-*\` archives contain the roc-lang/roc source these binaries were built from. GitHub's own \"Source code\" assets below are just this workflow repo."
+          The \`roc_nightly-reify-source-*\` archives contain the Karakatiza666/roc source these binaries were built from. GitHub's own \"Source code\" assets below are just this workflow repo."
 
           # Create the release (non-draft, non-prerelease)
           gh release create "$TAG" artifacts/**/* \
@@ -664,7 +564,6 @@ jobs:
     # the archives that shipped.
     if: >-
       ${{ !cancelled()
-        && github.event_name != 'pull_request'
         && needs.publish-release.result == 'success' }}
     needs: [resolve-roc-ref, publish-release]
     runs-on: ${{ matrix.os }}
@@ -688,7 +587,7 @@ jobs:
 
     steps:
       - name: build file name
-        run: echo "RELEASE_FOLDER_NAME=roc_nightly-${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
+        run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
 
       - name: Download release archive (Unix)
         if: runner.os != 'Windows'
@@ -758,120 +657,3 @@ jobs:
         run: |
           ./${{ env.RELEASE_FOLDER_NAME }}/roc fmt nightlies-repo/hello_world_test.roc
           ./${{ env.RELEASE_FOLDER_NAME }}/roc nightlies-repo/hello_world_test.roc
-
-  pin-nightly:
-    name: Pin hello_world_test.roc to the tested nightly
-    # The pin claims the tag is good, so it waits for the proof: this runs only
-    # once every smoke-test leg passed. test-archives has fail-fast disabled, so
-    # its result is 'success' only when all of them did. The explicit result
-    # checks are again there to opt out of a failed build leg's skip
-    # propagating this far down the graph.
-    # TEMP disabled: hello_world_test.roc is headerless for now.
-    if: >-
-      ${{ false
-        && !cancelled()
-        && github.event_name != 'pull_request'
-        && needs.publish-release.result == 'success'
-        && needs.test-archives.result == 'success' }}
-    needs: [resolve-roc-ref, publish-release, test-archives]
-    runs-on: ubuntu-latest
-    permissions:
-      # contents: write covers creating the PR's branch; opening and closing
-      # the PR itself needs pull-requests: write.
-      contents: write
-      pull-requests: write
-    env:
-      TAG: ${{ needs.resolve-roc-ref.outputs.tag }}
-
-    steps:
-      - name: Checkout nightlies repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
-
-      # Keep the repo's copy in sync with the tag that just shipped, so the
-      # next run's smoke test (and anyone reading the repo) sees the version
-      # actually verified to work.
-      #
-      # This cannot be a plain `git push` to main: main's ruleset requires
-      # changes to arrive through a pull request *and* every commit to carry a
-      # verified signature, and a push from the runner satisfies neither. So
-      # the commit is made on a side branch through GraphQL
-      # createCommitOnBranch, which GitHub signs with its own key, and a PR
-      # proposes it.
-      - name: Open a PR pinning hello_world_test.roc to this nightly
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BASE_BRANCH: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          FILE=hello_world_test.roc
-          PLATFORM_URL=$(grep -oE 'pf:[[:space:]]*platform[[:space:]]*"[^"]*"' "$FILE" | grep -oE '"[^"]*"' | tr -d '"')
-          perl -0777 -pi -e "s|app \[main!\] \{.*?\}|app [main!] {\n\tpf: platform \"$PLATFORM_URL\",\n\troc: \"$TAG\",\n}|s" "$FILE"
-          cat "$FILE"
-
-          if git diff --quiet -- "$FILE"; then
-            echo "$FILE is already pinned to $TAG"
-            exit 0
-          fi
-
-          # One branch per tag, so a rerun of the same nightly reuses its
-          # branch instead of piling up near-identical ones.
-          PR_BRANCH="pin-hello-world-test/$TAG"
-
-          # Yesterday's PR is obsolete the moment this one exists: both edit
-          # the same two lines, and only the newest pin is worth merging.
-          # Closing them keeps the queue at one open PR.
-          for old in $(gh pr list --state open --json number,headRefName \
-                --jq ".[] | select(.headRefName | startswith(\"pin-hello-world-test/\") and . != \"$PR_BRANCH\") | .number"); do
-            echo "Closing superseded pin PR #$old"
-            gh pr close "$old" --delete-branch --comment "Superseded by the pin for $TAG." || true
-          done
-
-          # Branch off main's current tip rather than this run's checkout, so
-          # the PR stays mergeable if main moved while the build ran.
-          BASE_OID=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_BRANCH" --jq .object.sha)
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$PR_BRANCH" >/dev/null 2>&1; then
-            HEAD_OID=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$PR_BRANCH" --jq .object.sha)
-          else
-            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/heads/$PR_BRANCH" -f sha="$BASE_OID" >/dev/null
-            HEAD_OID="$BASE_OID"
-          fi
-
-          # createCommitOnBranch takes whole-file contents, base64 encoded, so
-          # there is no merge to do and no signature for us to produce: GitHub
-          # writes and signs the commit itself.
-          jq -n \
-            --arg repo "$GITHUB_REPOSITORY" \
-            --arg branch "$PR_BRANCH" \
-            --arg oid "$HEAD_OID" \
-            --arg msg "Pin hello_world_test.roc to $TAG" \
-            --arg path "$FILE" \
-            --arg contents "$(base64 -w0 "$FILE")" \
-            '{
-              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }",
-              variables: {input: {
-                branch: {repositoryNameWithOwner: $repo, branchName: $branch},
-                message: {headline: $msg},
-                expectedHeadOid: $oid,
-                fileChanges: {additions: [{path: $path, contents: $contents}]}
-              }}
-            }' > commit-payload.json
-          gh api graphql --input commit-payload.json
-
-          if [ -n "$(gh pr list --state open --head "$PR_BRANCH" --json number --jq '.[].number')" ]; then
-            echo "PR for $PR_BRANCH already open"
-            exit 0
-          fi
-
-          gh pr create \
-            --base "$BASE_BRANCH" \
-            --head "$PR_BRANCH" \
-            --title "Pin hello_world_test.roc to $TAG" \
-            --body "Automated: [\`$TAG\`](https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG) was published and its smoke test passed on every OS it was built for, so this pins \`hello_world_test.roc\` to it."
-
-          # Best effort: auto-merge only exists if the repo has it enabled, and
-          # the pin is cosmetic enough that failing this job over it would be
-          # the wrong trade.
-          gh pr merge "$PR_BRANCH" --squash --auto --delete-branch \
-            || echo "::notice::Could not enable auto-merge on the pin PR; merge it by hand."
