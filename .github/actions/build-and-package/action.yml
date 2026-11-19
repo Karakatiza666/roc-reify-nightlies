@@ -243,7 +243,7 @@ runs:
         ARTIFACT_NAME: ${{ inputs.artifact_name }}
         DATE: ${{ inputs.date }}
         SHA: ${{ inputs.sha }}
-      run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-$PREFIX$ARTIFACT_NAME-$DATE-$SHA" >> $GITHUB_ENV
+      run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-${PREFIX}$ARTIFACT_NAME-$DATE-$SHA" >> $GITHUB_ENV
 
     - name: Package release
       shell: bash

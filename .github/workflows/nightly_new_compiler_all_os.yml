@@ -497,7 +497,7 @@ jobs:
       - name: build file name
         env:
           PREFIX: ${{ matrix.mode == 'debug' && 'debug-' || '' }}
-        run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-$PREFIX${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
+        run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-${PREFIX}${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
 
       - name: Download release archive (Unix)
         if: runner.os != 'Windows'
