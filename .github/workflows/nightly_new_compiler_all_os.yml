@@ -107,237 +107,105 @@ jobs:
           echo "base_nightly=$BASE_NIGHTLY" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
-  build-and-package:
-    name: build and package nightly release
+  # The gate builds one platform in one mode before anything else builds. If
+  # roc does not compile, or the binary cannot run a Roc program, the run stops
+  # here: every other build, the wasm artifacts and the release are skipped,
+  # and no compute goes into the other builds, which would fail the same way.
+  # It builds linux_x86_64 release because that is the cheapest runner and the
+  # archive most users download.
+  build-gate:
+    name: build and package nightly release (gate, linux_x86_64 release)
     needs: resolve-roc-ref
-    runs-on: ${{ matrix.os }}
-    env:
-      SHA: ${{ needs.resolve-roc-ref.outputs.sha }}
-      DATE: ${{ needs.resolve-roc-ref.outputs.date }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15-intel
-            artifact_name: macos_x86_64
-          - os: macos-15
-            artifact_name: macos_apple_silicon
-          - os: ubuntu-22.04
-            artifact_name: linux_x86_64
-          - os: ubuntu-24.04-arm
-            artifact_name: linux_arm64
-          - os: windows-2022
-            artifact_name: windows_x86_64
-          #- os: windows-11-arm
-          #  artifact_name: windows_arm64
-
-    defaults:
-      run:
-        shell: bash
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout Karakatiza666/roc
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
-        with:
-          repository: ${{ env.ROC_REPO }}
-          ref: ${{ needs.resolve-roc-ref.outputs.sha_full }}
-          path: roc-src
-
-      - name: Checkout nightlies repo for hello_world_test.roc
+      # Also brings in the build-and-package action and hello_world_test.roc.
+      - name: Checkout nightlies repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
         with:
           path: nightlies-repo
 
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # ratchet:mlugg/setup-zig@v2.2.1
+      # Same action as the build-and-package matrix, so the gate cannot drift
+      # from the legs it stands in for.
+      - name: Build and package
+        uses: ./nightlies-repo/.github/actions/build-and-package
         with:
-          version: ${{ env.ZIG_VERSION }}
-          use-cache: true
+          os: ubuntu-22.04
+          artifact_name: linux_x86_64
+          mode: release
+          roc_repo: ${{ env.ROC_REPO }}
+          roc_sha_full: ${{ needs.resolve-roc-ref.outputs.sha_full }}
+          tag: ${{ needs.resolve-roc-ref.outputs.tag }}
+          sha: ${{ needs.resolve-roc-ref.outputs.sha }}
+          date: ${{ needs.resolve-roc-ref.outputs.date }}
+          zig_version: ${{ env.ZIG_VERSION }}
 
-      # temp fix, see https://roc.zulipchat.com/#narrow/channel/395097-compiler-development/topic/CI/near/542085291
-      - name: delete llvm-config
-        if: startsWith(matrix.os, 'ubuntu') && endsWith(matrix.os, '-arm')
-        run: |
-          sudo rm /usr/lib/llvm-18/bin/llvm-config
+  build-and-package:
+    name: build and package nightly release
+    needs: [resolve-roc-ref, build-gate]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # release: optimized and stripped, the archives most users want.
+        # debug: unoptimized and with debug info, for crash reports. Built for
+        # Linux only.
+        mode: [release, debug]
+        artifact_name:
+          - macos_x86_64
+          - macos_apple_silicon
+          - linux_x86_64
+          - linux_arm64
+          - windows_x86_64
+          #- windows_arm64
+        exclude:
+          # build-gate already built this one.
+          - mode: release
+            artifact_name: linux_x86_64
+          - mode: debug
+            artifact_name: macos_x86_64
+          - mode: debug
+            artifact_name: macos_apple_silicon
+          - mode: debug
+            artifact_name: windows_x86_64
+        include:
+          - artifact_name: macos_x86_64
+            os: macos-15-intel
+          - artifact_name: macos_apple_silicon
+            os: macos-15
+          - artifact_name: linux_x86_64
+            os: ubuntu-22.04
+          - artifact_name: linux_arm64
+            os: ubuntu-24.04-arm
+          - artifact_name: windows_x86_64
+            os: windows-2022
+          #- artifact_name: windows_arm64
+          #  os: windows-11-arm
 
-      - name: Setup MSVC (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # ratchet:ilammy/msvc-dev-cmd@v1.13.0
+    steps:
+      # Also brings in the build-and-package action and hello_world_test.roc.
+      - name: Checkout nightlies repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
         with:
-          arch: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+          path: nightlies-repo
 
-      - name: Print CPU model (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: Get-WmiObject -Class Win32_Processor | Select-Object -ExpandProperty Name
-
-      - name: Print CPU model (macOS)
-        if: runner.os == 'macOS'
-        run: sysctl -a | grep machdep.cpu.brand_string || true
-
-      - name: Print CPU model (Linux)
-        if: runner.os == 'Linux'
-        run: lscpu | grep "Model name"
-
-      # -Dcompiler-version is interpolated here rather than read from $TAG at run
-      # time: the command runs inside a composite action, so it must not depend on
-      # this job's env reaching the action's own steps.
-      - name: build release
-        uses: ./roc-src/.github/actions/flaky-retry
+      - name: Build and package
+        uses: ./nightlies-repo/.github/actions/build-and-package
         with:
-          command: 'cd roc-src && zig build build-release -Dcompiler-version=${{ needs.resolve-roc-ref.outputs.tag }}'
-          error_string_contains: 'EndOfStream|build.zig.zon'
-          retry_count: 3
+          os: ${{ matrix.os }}
+          artifact_name: ${{ matrix.artifact_name }}
+          mode: ${{ matrix.mode }}
+          roc_repo: ${{ env.ROC_REPO }}
+          roc_sha_full: ${{ needs.resolve-roc-ref.outputs.sha_full }}
+          tag: ${{ needs.resolve-roc-ref.outputs.tag }}
+          sha: ${{ needs.resolve-roc-ref.outputs.sha }}
+          date: ${{ needs.resolve-roc-ref.outputs.date }}
+          zig_version: ${{ env.ZIG_VERSION }}
 
-      - name: check if statically linked (ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          file ./roc-src/zig-out/bin/roc | grep "statically linked"
-
-      # The release target is pinned to the aarch64 baseline in roc's build.zig
-      # (getReleaseTargetQuery). If that pin is lost, Zig falls back to native CPU
-      # detection and bakes this runner's armv9 features into the binary, which then
-      # dies with SIGILL on older aarch64 devices (Raspberry Pi 4, many phones).
-      # - name: check for non-baseline aarch64 instructions (linux arm64)
-      #   if: matrix.artifact_name == 'linux_arm64'
-      #   run: |
-      #     objdump -d --no-show-raw-insn ./roc-src/zig-out/bin/roc > /tmp/roc-dis.txt
-
-      #     # SVE/SVE2 vector and predicate registers.
-      #     SVE_RE='[[:space:]](z[0-9]+\.[bhsdq]|p[0-9]+(\.[bhsd])?/[zm])'
-      #     # LSE atomics (armv8.1).
-      #     LSE_RE='[[:space:]](cas|casp|swp|ld(add|clr|eor|set|smax|smin|umax|umin))(a|l|al)?(b|h)?([[:space:]]|$)'
-      #     # RCPC loads/stores (armv8.3/8.4).
-      #     RCPC_RE='[[:space:]](ldapr|ldapur|ldapursw?|stlur)(b|h)?([[:space:]]|$)'
-
-      #     fail=0
-      #     for pair in "SVE:$SVE_RE" "LSE atomics:$LSE_RE" "RCPC:$RCPC_RE"; do
-      #       name="${pair%%:*}"
-      #       re="${pair#*:}"
-      #       count=$(grep -cE "$re" /tmp/roc-dis.txt || true)
-      #       if [ "$count" -gt 0 ]; then
-      #         echo "Found $count $name instructions, which are not in the armv8.0-a baseline. Examples:"
-      #         grep -nE "$re" /tmp/roc-dis.txt | head -5 || true
-      #         fail=1
-      #       else
-      #         echo "OK: no $name instructions"
-      #       fi
-      #     done
-
-      #     if [ "$fail" -ne 0 ]; then
-      #       echo "This binary requires a newer CPU than the armv8.0-a baseline, so it will crash"
-      #       echo "with SIGILL on older aarch64 devices. Check getReleaseTargetQuery() in roc's build.zig."
-      #       exit 1
-      #     fi
-
-      - name: check if statically linked (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: |
-          otool_out="$(otool -L ./roc-src/zig-out/bin/roc)"
-          echo "$otool_out"
-          # Roc must only depend on libraries that ship with every macOS install, so it
-          # stays trivial to install. FSEvents-based file watching links CoreFoundation
-          # and CoreServices (which pull in libobjc); all of these are part of the OS.
-          unexpected="$(echo "$otool_out" | tail -n +2 | grep -vE '^[[:space:]]+(/usr/lib/libSystem\.B\.dylib|/usr/lib/libobjc\.A\.dylib|/System/Library/Frameworks/CoreFoundation\.framework/|/System/Library/Frameworks/CoreServices\.framework/)' || true)"
-          if [ -n "$unexpected" ]; then
-            echo "Looks like the nightly build has a new dynamic dependency, we want Roc to be super easy to install, so it should only depend on libraries that ship with macOS."
-            echo "Unexpected dependencies:"
-            echo "$unexpected"
-            exit 1
-          fi
-
-      - name: check if statically linked (Windows)
-        if: startsWith(matrix.os, 'windows')
-        shell: powershell
-        run: |
-          $imports = (Get-Command roc-src\zig-out\bin\roc.exe).FileVersionInfo.ImportCharacterSet
-          if ($imports) {
-              echo "Looks like the nightly executable has dynamic dependencies. We want Roc to be super easy to install, so it should be statically linked."
-              echo "Dynamic dependencies found:"
-              $imports | ForEach-Object { echo "  $_" }
-              exit 1
-          }
-
-      # Fail fast on a compiler that can't actually run a Roc program, before
-      # spending time packaging and publishing it. Every matrix leg's binary
-      # has to pass this before publish-release (which needs this job) can run.
-      #
-      # Running the test program downloads the platform tarball from GitHub
-      # releases, and that download flakes: 2026-09-15's macos_x86_64 leg died
-      # on "── ✗ download failed ── ... Error: HttpError" and took the whole
-      # nightly with it. The retry matches that signature only; roc's default
-      # pattern is about Zig dependency fetches and does not cover it.
-      #
-      # The action is pinned to roc-lang/roc 1bf9043 ("ci: stop flaky-retry from
-      # matching real failures"), rather than the ./roc-src copy the build step
-      # uses, so a change to that action in roc cannot alter a nightly run.
-      #
-      # Split by OS because flaky-retry runs `command` through bash on Unix and
-      # `cmd /c` on Windows, which need different path spellings.
-      - name: Run hello_world_test.roc (Unix)
-        if: runner.os != 'Windows'
-        uses: roc-lang/roc/.github/actions/flaky-retry@1bf9043142a49a5290f7897af7a7e6f2c70a6615 # ratchet:exclude
-        with:
-          command: './roc-src/zig-out/bin/roc nightlies-repo/hello_world_test.roc'
-          error_string_contains: 'download failed|Error: HttpError'
-          retry_count: 3
-
-      - name: Run hello_world_test.roc (Windows)
-        if: runner.os == 'Windows'
-        uses: roc-lang/roc/.github/actions/flaky-retry@1bf9043142a49a5290f7897af7a7e6f2c70a6615 # ratchet:exclude
-        with:
-          command: 'roc-src\zig-out\bin\roc.exe nightlies-repo\hello_world_test.roc'
-          error_string_contains: 'download failed|Error: HttpError'
-          retry_count: 3
-
-      - name: build file name
-        run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
-
-      - name: Package release
-        run: |
-          mkdir -p ${{ env.RELEASE_FOLDER_NAME }}
-          cp ./roc-src/zig-out/bin/roc ${{ env.RELEASE_FOLDER_NAME }}/
-          cp ./roc-src/LICENSE ./roc-src/legal_details ${{ env.RELEASE_FOLDER_NAME }}/
-
-      - name: Bundle Darwin sysroot (macOS only)
-        if: runner.os == 'macOS'
-        run: |
-          cp -r ./roc-src/src/cli/darwin ${{ env.RELEASE_FOLDER_NAME }}/
-
-      - name: Compress release (Unix)
-        if: runner.os != 'Windows'
-        run: tar -czvf "${{ env.RELEASE_FOLDER_NAME }}.tar.gz" ${{ env.RELEASE_FOLDER_NAME }}
-
-      - name: Compress release (Windows)
-        if: runner.os == 'Windows'
-        run: 7z a -tzip "${{ env.RELEASE_FOLDER_NAME }}.zip" ${{ env.RELEASE_FOLDER_NAME }}
-
-      - name: Calculate archive hash for security purposes (Unix)
-        if: runner.os != 'Windows'
-        run: sha256sum ${{ env.RELEASE_FOLDER_NAME }}.tar.gz
-
-      - name: Calculate archive hash for security purposes (Windows)
-        if: runner.os == 'Windows'
-        run: sha256sum ${{ env.RELEASE_FOLDER_NAME }}.zip
-
-      - name: Upload roc nightly archive (Unix)
-        if: runner.os != 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.RELEASE_FOLDER_NAME }}.tar.gz
-          path: ${{ env.RELEASE_FOLDER_NAME }}.tar.gz
-          retention-days: 4
-
-      - name: Upload roc nightly archive (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.RELEASE_FOLDER_NAME }}.zip
-          path: ${{ env.RELEASE_FOLDER_NAME }}.zip
-          retention-days: 4
-
+  # The wasm builds compile roc too, so they wait for the gate like the matrix.
   build-wasm-artifacts:
     name: build compressed web wasm artifacts
-    needs: resolve-roc-ref
+    needs: [resolve-roc-ref, build-gate]
     runs-on: ubuntu-latest
 
     steps:
@@ -398,6 +266,8 @@ jobs:
           if-no-files-found: error
           retention-days: 4
 
+  # This job compiles nothing and takes about a minute, so it does not wait for
+  # build-gate. If the gate fails, its archive is uploaded but never published.
   package-source:
     name: Package roc source code
     needs: resolve-roc-ref
@@ -463,13 +333,18 @@ jobs:
     # archives that did build are still worth shipping, and a missing one is
     # better than nothing at all for that day. So instead of inheriting the
     # default "skip if any dependency failed", this job runs as long as the
-    # run was not cancelled and resolve-roc-ref itself produced a tag. Which archives
-    # actually exist is decided below, from what was uploaded. The failed build leg still shows up red, so the run
-    # as a whole is still reported as failed.
+    # run was not cancelled, resolve-roc-ref itself produced a tag and
+    # build-gate succeeded. Which archives actually exist is decided below,
+    # from what was uploaded. The failed build leg still shows up red, so the
+    # run as a whole is still reported as failed.
+    #
+    # A failed gate is different: then nothing else was built, and the release
+    # is not published.
     if: >-
       ${{ !cancelled()
-        && needs.resolve-roc-ref.result == 'success' }}
-    needs: [resolve-roc-ref, build-and-package, build-wasm-artifacts, package-source]
+        && needs.resolve-roc-ref.result == 'success'
+        && needs.build-gate.result == 'success' }}
+    needs: [resolve-roc-ref, build-gate, build-and-package, build-wasm-artifacts, package-source]
     runs-on: ubuntu-latest
     outputs:
       test_matrix: ${{ steps.built.outputs.test_matrix }}
@@ -492,28 +367,49 @@ jobs:
 
       # Because this job now runs even when a build leg failed, it has to work
       # out for itself which platforms made it into ./artifacts, warn about the
-      # ones that did not, and refuse to publish a release with no binaries at
-      # all. The list it produces also drives the smoke-test matrix below, so
-      # those don't try to download an archive that was never released.
+      # ones that did not, and refuse to publish a release with no release-mode
+      # binaries at all (debug archives alone are not a release). The list it
+      # produces also drives the smoke-test matrix below, so those don't try to
+      # download an archive that was never released.
+      #
+      # Each entry of the list is <mode>:<platform>. A debug archive is named
+      # roc_nightly-reify-debug-<platform>-..., and no platform name starts
+      # with "debug-", so the release glob never matches a debug archive.
       - name: Determine which archives were built
         id: built
         run: |
           set -euo pipefail
 
           built=()
-          for platform in macos_x86_64 macos_apple_silicon linux_x86_64 linux_arm64 windows_x86_64; do
-            if compgen -G "artifacts/roc_nightly-reify-$platform-*/*" > /dev/null; then
-              built+=("$platform")
+          release_count=0
+          debug_count=0
+          # Debug archives are built for Linux only.
+          for entry in release:macos_x86_64 release:macos_apple_silicon release:linux_x86_64 release:linux_arm64 release:windows_x86_64 debug:linux_x86_64 debug:linux_arm64; do
+            mode="${entry%%:*}"
+            platform="${entry#*:}"
+            if [ "$mode" = debug ]; then prefix="debug-"; else prefix=""; fi
+            if compgen -G "artifacts/roc_nightly-reify-$prefix$platform-*/*" > /dev/null; then
+              built+=("$mode:$platform")
+              if [ "$mode" = debug ]; then
+                debug_count=$((debug_count + 1))
+              else
+                release_count=$((release_count + 1))
+              fi
             else
-              echo "::warning::No archive was built for $platform; it will be missing from $TAG."
+              echo "::warning::No $mode archive was built for $platform; it will be missing from $TAG."
             fi
           done
 
-          if [ ${#built[@]} -eq 0 ]; then
-            echo "::error::No platform archives were built, refusing to publish a release without binaries."
+          if [ "$release_count" -eq 0 ]; then
+            echo "::error::No release-mode platform archives were built, refusing to publish a release without binaries."
             exit 1
           fi
           echo "Publishing archives for: ${built[*]}"
+          if [ "$debug_count" -gt 0 ]; then
+            echo "has_debug=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_debug=false" >> "$GITHUB_OUTPUT"
+          fi
 
           for extra in playground.wasm.zst repl.wasm.zst echo.wasm.zst "roc_nightly-reify-source-*"; do
             compgen -G "artifacts/$extra/*" > /dev/null \
@@ -522,20 +418,24 @@ jobs:
 
           # Every OS the smoke tests cover, paired with the archive it needs.
           # Legs whose archive is missing are dropped rather than left to fail
-          # on a 404 download.
-          #- {os: windows-11-arm, artifact_name: windows_arm64}
+          # on a 404 download. Release archives are tested on every OS. Debug
+          # archives (Linux only) come from the same target settings, so one
+          # OS for each platform is sufficient for them.
+          #- {os: windows-11-arm, artifact_name: windows_arm64, mode: release}
           matrix=$(jq -cn --args '
             [
-              {os: "macos-15-intel", artifact_name: "macos_x86_64"},
-              {os: "macos-15",       artifact_name: "macos_apple_silicon"},
-              {os: "macos-26-intel", artifact_name: "macos_x86_64"},
-              {os: "macos-26",       artifact_name: "macos_apple_silicon"},
-              {os: "ubuntu-22.04",   artifact_name: "linux_x86_64"},
-              {os: "ubuntu-26.04",   artifact_name: "linux_x86_64"},
-              {os: "ubuntu-26.04-arm", artifact_name: "linux_arm64"},
-              {os: "windows-2022",   artifact_name: "windows_x86_64"},
-              {os: "windows-2025",   artifact_name: "windows_x86_64"}
-            ] | map(select(.artifact_name as $a | $ARGS.positional | index($a)))
+              {os: "macos-15-intel", artifact_name: "macos_x86_64",        mode: "release"},
+              {os: "macos-15",       artifact_name: "macos_apple_silicon", mode: "release"},
+              {os: "macos-26-intel", artifact_name: "macos_x86_64",        mode: "release"},
+              {os: "macos-26",       artifact_name: "macos_apple_silicon", mode: "release"},
+              {os: "ubuntu-22.04",   artifact_name: "linux_x86_64",        mode: "release"},
+              {os: "ubuntu-26.04",   artifact_name: "linux_x86_64",        mode: "release"},
+              {os: "ubuntu-26.04-arm", artifact_name: "linux_arm64",       mode: "release"},
+              {os: "windows-2022",   artifact_name: "windows_x86_64",      mode: "release"},
+              {os: "windows-2025",   artifact_name: "windows_x86_64",      mode: "release"},
+              {os: "ubuntu-22.04",   artifact_name: "linux_x86_64",        mode: "debug"},
+              {os: "ubuntu-26.04-arm", artifact_name: "linux_arm64",       mode: "debug"}
+            ] | map(select("\(.mode):\(.artifact_name)" as $a | $ARGS.positional | index($a)))
             | {include: .}' "${built[@]}")
           echo "$matrix"
           echo "test_matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -543,10 +443,17 @@ jobs:
       - name: Create Release with gh CLI
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HAS_DEBUG: ${{ steps.built.outputs.has_debug }}
         run: |
           BODY="Nightly build of the new Roc compiler from the reify branch of [Karakatiza666/roc](https://github.com/Karakatiza666/roc), commit [${{ env.SHA }}](https://github.com/Karakatiza666/roc/commit/${{ env.SHA_FULL }}), rebased on upstream nightly [${{ env.BASE_NIGHTLY }}](https://github.com/roc-lang/nightlies/releases/tag/${{ env.BASE_NIGHTLY }}).
 
           The \`roc_nightly-reify-source-*\` archives contain the Karakatiza666/roc source these binaries were built from. GitHub's own \"Source code\" assets below are just this workflow repo."
+
+          if [ "$HAS_DEBUG" = true ]; then
+            BODY="$BODY
+
+          The \`roc_nightly-reify-debug-*\` archives contain unoptimized builds with debug info, for crash reports only: they are larger and much slower than the normal archives."
+          fi
 
           # Create the release (non-draft, non-prerelease)
           gh release create "$TAG" artifacts/**/* \
@@ -586,8 +493,11 @@ jobs:
       contents: read
 
     steps:
+      # The same names as the build-and-package action gives the archives.
       - name: build file name
-        run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
+        env:
+          PREFIX: ${{ matrix.mode == 'debug' && 'debug-' || '' }}
+        run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-$PREFIX${{ matrix.artifact_name }}-$DATE-$SHA" >> $GITHUB_ENV
 
       - name: Download release archive (Unix)
         if: runner.os != 'Windows'
@@ -636,6 +546,8 @@ jobs:
       # The version is baked in by -Dcompiler-version at build time, so nothing
       # downstream can notice if that flag stops being passed and the binaries
       # silently go back to reporting "release-fast-<sha>". This is that check.
+      # -Dcompiler-version replaces the whole version string in every build
+      # mode, so a debug build reports the tag too, not "debug-<sha>".
       - name: Check reported version matches the release tag
         run: |
           version_out="$(./${{ env.RELEASE_FOLDER_NAME }}/roc version)"

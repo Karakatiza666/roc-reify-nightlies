@@ -1,0 +1,295 @@
+name: Build and package roc
+description: >-
+  Builds one roc binary for one platform and mode, checks it, runs
+  hello_world_test.roc with it, then packages and uploads the archive. The gate
+  job and the build-and-package matrix both use this action, so the gate builds
+  exactly what every matrix leg builds.
+
+# The caller checks out this repo to nightlies-repo/ before it uses the action:
+# the action itself lives there, and it reads hello_world_test.roc from there.
+inputs:
+  os:
+    description: "The runner label of the calling job, for example ubuntu-22.04."
+    required: true
+  artifact_name:
+    description: "The platform name in the archive name, for example linux_x86_64."
+    required: true
+  mode:
+    description: "release (optimized, stripped) or debug (unoptimized, with debug info). debug is for Linux only."
+    required: true
+  roc_repo:
+    description: "The repository to build roc from."
+    required: true
+  roc_sha_full:
+    description: "The full commit of roc_repo to build."
+    required: true
+  tag:
+    description: "The release tag. It is baked into the binary with -Dcompiler-version."
+    required: true
+  sha:
+    description: "The short commit, for the archive name."
+    required: true
+  date:
+    description: "The date, for the archive name."
+    required: true
+  zig_version:
+    description: "The Zig version to build with."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Debug archives are published for Linux only. The debug info check below
+    # knows only the Linux format, so a debug build for another OS stops here.
+    - name: Check mode
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        case "$MODE" in
+          release) ;;
+          debug)
+            if [ "$RUNNER_OS" != Linux ]; then
+              echo "::error::mode debug is for Linux only, but this runner is $RUNNER_OS."
+              exit 1
+            fi
+            ;;
+          *) echo "::error::mode must be release or debug, but got '$MODE'."; exit 1 ;;
+        esac
+
+    - name: Checkout Karakatiza666/roc
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
+      with:
+        repository: ${{ inputs.roc_repo }}
+        ref: ${{ inputs.roc_sha_full }}
+        path: roc-src
+
+    - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # ratchet:mlugg/setup-zig@v2.2.1
+      with:
+        version: ${{ inputs.zig_version }}
+        use-cache: true
+
+    # temp fix, see https://roc.zulipchat.com/#narrow/channel/395097-compiler-development/topic/CI/near/542085291
+    - name: delete llvm-config
+      if: startsWith(inputs.os, 'ubuntu') && endsWith(inputs.os, '-arm')
+      shell: bash
+      run: |
+        sudo rm /usr/lib/llvm-18/bin/llvm-config
+
+    - name: Setup MSVC (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # ratchet:ilammy/msvc-dev-cmd@v1.13.0
+      with:
+        arch: ${{ inputs.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+
+    - name: Print CPU model (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: Get-WmiObject -Class Win32_Processor | Select-Object -ExpandProperty Name
+
+    - name: Print CPU model (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: sysctl -a | grep machdep.cpu.brand_string || true
+
+    - name: Print CPU model (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: lscpu | grep "Model name"
+
+    # -Dcompiler-version is interpolated here rather than read from $TAG at run
+    # time: the command runs inside a composite action, so it must not depend on
+    # this job's env reaching the action's own steps.
+    #
+    # Both modes use build-release, so both use the release target query of
+    # roc's build.zig (getReleaseTargetQuery: static musl on Linux, baseline CPU,
+    # the pinned minimum macOS). A debug build adds -Doptimize=Debug, which
+    # build-release honors, and -Dstrip=false, so that the binary keeps its
+    # debug info for stack traces. A later step checks that it did.
+    - name: build ${{ inputs.mode }}
+      uses: ./roc-src/.github/actions/flaky-retry
+      with:
+        command: 'cd roc-src && zig build build-release ${{ inputs.mode == ''debug'' && ''-Doptimize=Debug -Dstrip=false '' || '''' }}-Dcompiler-version=${{ inputs.tag }}'
+        error_string_contains: 'EndOfStream|build.zig.zon'
+        retry_count: 3
+
+    - name: check if statically linked (ubuntu)
+      if: startsWith(inputs.os, 'ubuntu')
+      shell: bash
+      run: |
+        file ./roc-src/zig-out/bin/roc | grep "statically linked"
+
+    # The release target is pinned to the aarch64 baseline in roc's build.zig
+    # (getReleaseTargetQuery). If that pin is lost, Zig falls back to native CPU
+    # detection and bakes this runner's armv9 features into the binary, which then
+    # dies with SIGILL on older aarch64 devices (Raspberry Pi 4, many phones).
+    # - name: check for non-baseline aarch64 instructions (linux arm64)
+    #   if: inputs.artifact_name == 'linux_arm64'
+    #   shell: bash
+    #   run: |
+    #     objdump -d --no-show-raw-insn ./roc-src/zig-out/bin/roc > /tmp/roc-dis.txt
+
+    #     # SVE/SVE2 vector and predicate registers.
+    #     SVE_RE='[[:space:]](z[0-9]+\.[bhsdq]|p[0-9]+(\.[bhsd])?/[zm])'
+    #     # LSE atomics (armv8.1).
+    #     LSE_RE='[[:space:]](cas|casp|swp|ld(add|clr|eor|set|smax|smin|umax|umin))(a|l|al)?(b|h)?([[:space:]]|$)'
+    #     # RCPC loads/stores (armv8.3/8.4).
+    #     RCPC_RE='[[:space:]](ldapr|ldapur|ldapursw?|stlur)(b|h)?([[:space:]]|$)'
+
+    #     fail=0
+    #     for pair in "SVE:$SVE_RE" "LSE atomics:$LSE_RE" "RCPC:$RCPC_RE"; do
+    #       name="${pair%%:*}"
+    #       re="${pair#*:}"
+    #       count=$(grep -cE "$re" /tmp/roc-dis.txt || true)
+    #       if [ "$count" -gt 0 ]; then
+    #         echo "Found $count $name instructions, which are not in the armv8.0-a baseline. Examples:"
+    #         grep -nE "$re" /tmp/roc-dis.txt | head -5 || true
+    #         fail=1
+    #       else
+    #         echo "OK: no $name instructions"
+    #       fi
+    #     done
+
+    #     if [ "$fail" -ne 0 ]; then
+    #       echo "This binary requires a newer CPU than the armv8.0-a baseline, so it will crash"
+    #       echo "with SIGILL on older aarch64 devices. Check getReleaseTargetQuery() in roc's build.zig."
+    #       exit 1
+    #     fi
+
+    - name: check if statically linked (macOS)
+      if: startsWith(inputs.os, 'macos')
+      shell: bash
+      run: |
+        otool_out="$(otool -L ./roc-src/zig-out/bin/roc)"
+        echo "$otool_out"
+        # Roc must only depend on libraries that ship with every macOS install, so it
+        # stays trivial to install. FSEvents-based file watching links CoreFoundation
+        # and CoreServices (which pull in libobjc); all of these are part of the OS.
+        unexpected="$(echo "$otool_out" | tail -n +2 | grep -vE '^[[:space:]]+(/usr/lib/libSystem\.B\.dylib|/usr/lib/libobjc\.A\.dylib|/System/Library/Frameworks/CoreFoundation\.framework/|/System/Library/Frameworks/CoreServices\.framework/)' || true)"
+        if [ -n "$unexpected" ]; then
+          echo "Looks like the nightly build has a new dynamic dependency, we want Roc to be super easy to install, so it should only depend on libraries that ship with macOS."
+          echo "Unexpected dependencies:"
+          echo "$unexpected"
+          exit 1
+        fi
+
+    - name: check if statically linked (Windows)
+      if: startsWith(inputs.os, 'windows')
+      shell: powershell
+      run: |
+        $imports = (Get-Command roc-src\zig-out\bin\roc.exe).FileVersionInfo.ImportCharacterSet
+        if ($imports) {
+            echo "Looks like the nightly executable has dynamic dependencies. We want Roc to be super easy to install, so it should be statically linked."
+            echo "Dynamic dependencies found:"
+            $imports | ForEach-Object { echo "  $_" }
+            exit 1
+        }
+
+    # A debug archive is only useful if a crash in it gives a stack trace with
+    # file names and line numbers. If build.zig stops honoring -Dstrip=false
+    # for build-release, the build still succeeds, but the binary is stripped.
+    # This step makes that a failure of this leg, not a useless archive.
+    - name: check debug info (debug)
+      if: inputs.mode == 'debug'
+      shell: bash
+      run: |
+        file_out="$(file ./roc-src/zig-out/bin/roc)"
+        echo "$file_out"
+        if ! echo "$file_out" | grep -q "with debug_info"; then
+          echo "::error::The debug binary has no debug info. Check that build-release in roc's build.zig honors -Dstrip=false."
+          exit 1
+        fi
+
+    # Fail fast on a compiler that can't actually run a Roc program, before
+    # spending time packaging and publishing it. Every matrix leg's binary
+    # has to pass this before publish-release (which needs this job) can run.
+    #
+    # Running the test program downloads the platform tarball from GitHub
+    # releases, and that download flakes: 2026-09-15's macos_x86_64 leg died
+    # on "── ✗ download failed ── ... Error: HttpError" and took the whole
+    # nightly with it. The retry matches that signature only; roc's default
+    # pattern is about Zig dependency fetches and does not cover it.
+    #
+    # The action is pinned to roc-lang/roc 1bf9043 ("ci: stop flaky-retry from
+    # matching real failures"), rather than the ./roc-src copy the build step
+    # uses, so a change to that action in roc cannot alter a nightly run.
+    #
+    # Split by OS because flaky-retry runs `command` through bash on Unix and
+    # `cmd /c` on Windows, which need different path spellings.
+    - name: Run hello_world_test.roc (Unix)
+      if: runner.os != 'Windows'
+      uses: roc-lang/roc/.github/actions/flaky-retry@1bf9043142a49a5290f7897af7a7e6f2c70a6615 # ratchet:exclude
+      with:
+        command: './roc-src/zig-out/bin/roc nightlies-repo/hello_world_test.roc'
+        error_string_contains: 'download failed|Error: HttpError'
+        retry_count: 3
+
+    - name: Run hello_world_test.roc (Windows)
+      if: runner.os == 'Windows'
+      uses: roc-lang/roc/.github/actions/flaky-retry@1bf9043142a49a5290f7897af7a7e6f2c70a6615 # ratchet:exclude
+      with:
+        command: 'roc-src\zig-out\bin\roc.exe nightlies-repo\hello_world_test.roc'
+        error_string_contains: 'download failed|Error: HttpError'
+        retry_count: 3
+
+    # Release archives keep their old names. Debug archives get "debug-" in
+    # front of the platform: roc_nightly-reify-debug-<platform>-<date>-<sha>.
+    # No platform name starts with "debug-", so publish-release can tell the
+    # two modes apart by name.
+    - name: build file name
+      shell: bash
+      env:
+        PREFIX: ${{ inputs.mode == 'debug' && 'debug-' || '' }}
+        ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        DATE: ${{ inputs.date }}
+        SHA: ${{ inputs.sha }}
+      run: echo "RELEASE_FOLDER_NAME=roc_nightly-reify-$PREFIX$ARTIFACT_NAME-$DATE-$SHA" >> $GITHUB_ENV
+
+    - name: Package release
+      shell: bash
+      run: |
+        mkdir -p "$RELEASE_FOLDER_NAME"
+        cp ./roc-src/zig-out/bin/roc "$RELEASE_FOLDER_NAME"/
+        cp ./roc-src/LICENSE ./roc-src/legal_details "$RELEASE_FOLDER_NAME"/
+
+    - name: Bundle Darwin sysroot (macOS only)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        cp -r ./roc-src/src/cli/darwin "$RELEASE_FOLDER_NAME"/
+
+    - name: Compress release (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: tar -czvf "$RELEASE_FOLDER_NAME.tar.gz" "$RELEASE_FOLDER_NAME"
+
+    - name: Compress release (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: 7z a -tzip "$RELEASE_FOLDER_NAME.zip" "$RELEASE_FOLDER_NAME"
+
+    - name: Calculate archive hash for security purposes (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: sha256sum "$RELEASE_FOLDER_NAME.tar.gz"
+
+    - name: Calculate archive hash for security purposes (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: sha256sum "$RELEASE_FOLDER_NAME.zip"
+
+    - name: Upload roc nightly archive (Unix)
+      if: runner.os != 'Windows'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.RELEASE_FOLDER_NAME }}.tar.gz
+        path: ${{ env.RELEASE_FOLDER_NAME }}.tar.gz
+        retention-days: 4
+
+    - name: Upload roc nightly archive (Windows)
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.RELEASE_FOLDER_NAME }}.zip
+        path: ${{ env.RELEASE_FOLDER_NAME }}.zip
+        retention-days: 4
